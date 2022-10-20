@@ -1,0 +1,4 @@
+git+https://github.com/j-hsiao/py-namespace.git
+git+https://github.com/j-hsiao/py-utils.git
+numpy
+opencv-python

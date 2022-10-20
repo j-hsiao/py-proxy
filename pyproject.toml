@@ -1,0 +1,3 @@
+[build-system]
+requires = ["setuptools", "jhsiao.namespace @ git+https://github.com/j-hsiao/py-namespace.git"]
+build-backend = "setuptools.build_meta"
