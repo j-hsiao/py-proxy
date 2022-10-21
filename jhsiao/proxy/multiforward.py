@@ -1,160 +1,228 @@
+from __future__ import print_function
+__all__ = ['MultiForwarder']
 import io
 import threading
 import traceback
 import time
 
-from jhsiao.ipc import polling
+from jhsiao.ipc import polling, pollable
 
-class MultiForwarder(object):
-    """Forward data from multiple pairs."""
-    def __init__(self, flushdelay=0.01):
-        self.flushdelay = flushdelay
-        self.pairs = {}
-        self.pending = []
-        self.cond = threading.Condition()
-        self.running = True
-        self.t = threading.Thread(target=self.loop)
-        self.t.start()
+class SameSrc(object):
+    """Dummy class to hash/compare equal to a same input."""
+    def __init__(self, src):
+        self.src = src
+        self.fileno = self.src.fileno
+    def __hash__(self):
+        return self.fileno()
+    def __eq__(self, o):
+        return self.src is o.src
 
-    def add(self, sock1, sock2, duplex=True):
-        with self.cond:
-            self.pending.append((sock1, sock2))
-            if duplex:
-                self.pending.append((sock2, sock1))
-            self.cond.notify()
+class Forwarder(SameSrc):
+    """Class for 1-direction forwarding."""
+    def __init__(self, src, dst):
+        super(Forwarder, self).__init__(src)
+        self.readinto = src.readinto
+        self.dst = dst
+        self.o = io.BufferedWriter(dst)
+        self.flushtime = None
+        self.flush = self.o.flush
+        self.write = self.o.write
 
-    def _has_clients(self):
-        return self.pending or not self.running
+    def __call__(self, state, flushtime):
+        """Forward a chunk.
 
-    @classmethod
-    def _forward_chunks(
-        cls, ready, buf, pairs, pending, lastwrites, flushtime, poller):
-        """Read chunks from ready and write to dsts.
-
-        Return if any were closed.
+        buf: buffer to use for forwarding.
+        flushtime: timeout for flushing.
+        Return True if failure (src closed or failed to write to dst).
         """
-        ret = False
-        for src in ready:
-            dst = pairs.get(src, None)
-            if dst is None:
-                continue
-            amt = src.readinto(buf)
-            if amt:
-                try:
-                    dst.write(buf[:amt])
-                except Exception:
-                    traceback.print_exc()
-                    ret = cls._close(src, pairs, pending, lastwrites, True, poller) or ret
-                else:
-                    lastwrites[src] = flushtime
-                    pending.add(src)
-            else:
-                ret = cls._close(src, pairs, pending, lastwrites, False, poller) or ret
-        return ret
-
-    @classmethod
-    def _close(cls, src, pairs, pending, lastwrites, closeall, poller):
-        """Remove forwarding, checking for cycles.
-
-        closeall: close every related socket.
-        """
-        dst = pairs.get(src, None)
-        if dst is None:
-            return False
-        while dst is not None:
-            del pairs[src]
-            pending.discard(src)
-            lastwrites.pop(src, None)
+        buf = state._buf
+        try:
+            amt = self.readinto(buf)
+        except Exception:
+            state._wpending.discard(self)
+            return True
+        if amt:
             try:
-                dst.flush()
+                self.write(buf[:amt])
+            except Exception:
+                state._wpending.discard(self)
+                return True
+            state._wpending.add(self)
+            self.flushtime = flushtime
+            return False
+        else:
+            state._wpending.discard(self)
+            return True
+
+    def __repr__(self):
+        return '{}->{}'.format(self.src.name, self.dst.name)
+
+    def close(self, state):
+        """Close a forwarder.
+
+        because duplex, src could also be a dst
+        dst could also be a src.
+        If dst is a src, just SHUT_WR
+        remove it if applicable on some other iteration
+        if src is also a dst, no need to close
+        eventually its src will be closed after this call
+        and it will be a dst that is not a src and so closed
+        at that point.
+        """
+        src = self.src
+        dst = self.dst
+        try:
+            state._poller.unregister(self)
+        except Exception:
+            traceback.print_exc()
+        try:
+            self.flush()
+        except Exception:
+            traceback.print_exc()
+        with state.lock:
+            forwards = state.forwards
+            dsts = state.dsts
+            forwards.discard(self)
+            dsts.discard(dst.fileno())
+            dst_is_src = SameSrc(dst) in forwards
+            src_is_dst = src.fileno() in dsts
+        if dst_is_src:
+            print('shut down dst', dst.name)
+            try:
+                self.o.detach()
             except Exception:
                 traceback.print_exc()
-                closeall = True
-            else:
+            try:
+                dst.shutdown(dst.SHUT_WR)
+            except Exception:
+                traceback.print_exc()
+        else:
+            try:
+                print('closing dst', dst.name)
+                self.o.close()
+            except Exception:
+                traceback.print_exc()
+        if src_is_dst:
+            print('shut down src', src.name)
+            try:
+                src.shutdown(src.SHUT_RD)
+            except Exception:
+                traceback.print_exc()
+        else:
+            try:
+                print('closing src', src.name)
+                src.close()
+            except Exception:
+                pass
+
+class StopError(Exception):
+    pass
+class MultiForwarder(object):
+    """Forward data from multiple pairs."""
+    class Ev(pollable.Pollable):
+        def __call__(self, state, flushtime):
+            self.clear()
+            with state.lock:
+                forwards = state.forwards
+                if not state.running:
+                    raise StopError()
+                poller = state._poller
+                for f in state.pending:
+                    print('adding', f)
+                    forwards.add(f)
+                    poller.register(f, 'r')
+                del state.pending[:]
+            return False
+        def close(self, state=None):
+            if state is not None:
                 try:
-                    dst.raw.shutdown(dst.raw.SHUT_WR)
+                    state._poller.unregister(self)
                 except Exception:
                     traceback.print_exc()
-                    closeall = True
-            poller.unregister(src)
-            if closeall or not [d for d in pairs.values() if d.raw is src]:
-                try:
-                    src.close()
-                except Exception:
-                    traceback.print_exc()
-            if dst.raw not in pairs:
-                try:
-                    dst.close()
-                except Exception:
-                    traceback.print_exc()
-                return True
-            elif closeall:
-                src = dst.raw
-                dst = pairs[src]
-            else:
-                return True
-        return True
+            super(MultiForwarder.Ev, self).close()
+
+    def __init__(self, flushdelay=0.01):
+        self.lock = threading.Lock()
+        self.pending = []
+        self.ev = self.Ev()
+        self.running = True
+        self.forwards = set()
+        self.dsts = set()
+        self.t = threading.Thread(target=self.loop)
+        # loop-only variables
+        self._flushdelay = flushdelay
+        self._poller = polling.Poller()
+        self._poller.register(self.ev, 'r')
+        self._wpending = set()
+        self._buf = memoryview(bytearray(io.DEFAULT_BUFFER_SIZE))
+        self.t.start()
+
+    def add(self, f1, f2, duplex=True):
+        """Add Sockfiles."""
+        with self.lock:
+            if not self.running:
+                raise RuntimeError('Cannot add if loop has stopped.')
+            if f2.fileno() in self.dsts:
+                raise ValueError('Already forwarding into {}'.format(f2.fileno()))
+            elif SameSrc(f1) in self.forwards:
+                raise ValueError('Already forwarding from {}'.format(f1.fileno()))
+            self.pending.append(Forwarder(f1, f2))
+            self.dsts.add(f2.fileno())
+            if duplex:
+                self.pending.append(Forwarder(f2, f1))
+                self.dsts.add(f1.fileno())
+            self.ev.set()
 
     def loop(self):
-        pairs = self.pairs
-        cond = self.cond
-        pending = self.pending
-        poller = polling.Poller()
-        flushdelay = self.flushdelay
-        buf = memoryview(bytearray(io.DEFAULT_BUFFER_SIZE))
-        wpending = set()
-        lastwrites = {}
-        ptime = 1
+        poller = self._poller
+        flushdelay = self._flushdelay
+        wpending = self._wpending
+        ptime = None
         try:
             while 1:
-                with cond:
-                    if not pairs:
-                        cond.wait_for(self._has_clients)
-                while 1:
-                    with cond:
-                        if not self.running:
-                            return
-                        if pending:
-                            for s1, s2 in pending:
-                                pairs[s1] = io.BufferedWriter(s2)
-                                poller.register(s1, 'r')
-                            del pending[:]
-                    r, w, x = poller.poll(ptime)
-                    now = time.time()
-                    if r:
-                        endtime = now + flushdelay
-                        if self._forward_chunks(
-                            r, buf, pairs, wpending, lastwrites, endtime, poller) and not pairs:
-                            break
-                    else:
-                        endtime = now+1
-                    toflush = wpending.difference(r)
-                    check = False
-                    for src in toflush:
-                        tm = lastwrites.get(src, None)
-                        if tm < now:
-                            try:
-                                pairs[src].flush()
-                            except Exception:
-                                traceback.print_exc()
-                                check = self._close(src, pairs, wpending, lastwrites, True, poller) or check
-                            else:
-                                wpending.discard(src)
-                        elif tm < endtime:
-                            endtime = tm
-                    if check and not pairs:
-                        break
-                    ptime = endtime - now
+                r, w, x = poller.poll(ptime)
+                now = time.time()
+                if r:
+                    endtime = now + flushdelay
+                    toremove = [item for item in r if item(self, endtime)]
+                    for thing in toremove:
+                        thing.close(self)
+                else:
+                    endtime = None
+                toflush = wpending.difference(r)
+                for f in toflush:
+                    tm = f.flushtime
+                    if tm <= now:
+                        wpending.discard(f)
+                        try:
+                            f.flush()
+                        except Exception:
+                            f.close(self)
+                    elif endtime is None or tm < endtime:
+                        endtime = tm
+                ptime = None if endtime is None else endtime - now
+        except StopError:
+            print('loop exit')
+        except Exception:
+            print('loop error')
+            traceback.print_exc()
         finally:
-            for src in list(pairs):
-                self._close(src, pairs, wpending, lastwrites, True, poller)
+            with self.lock:
+                self.running = False
+                toclose = list(self.pending)
+                del self.pending[:]
+                toclose.extend(self.forwards)
+                self.forwards.clear()
+            for f in toclose:
+                f.close(self)
             poller.close()
 
     def close(self):
         if self.t is not None:
-            with self.cond:
-                self.running = False
-                self.cond.notify()
+            with self.lock:
+                if self.running:
+                    self.running = False
+                    self.ev.set()
             self.t.join()
             self.t = None
 
@@ -212,7 +280,7 @@ if __name__ == '__main__':
             else:
                 print(block[:amt].tobytes())
             amt = f.readinto(block)
-        print('done')
+        print('stream end')
 
     t = threading.Thread(target=_reader, args=(sockets.Sockfile(s3, 'rb'),))
     t.start()
@@ -224,5 +292,4 @@ if __name__ == '__main__':
             f.flush()
             val = inp('>>>')
     t.join()
-    inp('return to close')
     forwarder.close()
