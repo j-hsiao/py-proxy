@@ -11,5 +11,6 @@ setup(
     packages=['jhsiao', 'jhsiao.proxy'],
     install_requires=[
         'jhsiao-utils @ git+https://github.com/j-hsiao/py-utils.git',
-        'jhsiao-ipc @ git+https://github.com/j-hsiao/py-ipc.git']
+        'jhsiao-ipc @ git+https://github.com/j-hsiao/py-ipc.git',
+        'requests']
 )
