@@ -1,4 +1,10 @@
-"""Parsing http1."""
+"""Parsing http1.
+
+Parsing uses binary file
+because using TextIOWrapper may read more than needed so cannot then
+switch to using binary because some data was already grabbed by the
+text wrapper.
+"""
 import re
 from collections import defaultdict
 import sys
@@ -26,9 +32,13 @@ class Startline(object):
         f: a binary file
         """
         line = f.readline(io.DEFAULT_BUFFER_SIZE)
-        if not line.endswith(b'\n'):
+        if not line:
+            raise HTTPError(-1, 'closed')
+        elif not line.endswith(b'\n'):
             raise HTTPError(414, 'Request-URI Too Long')
         match = self.pattern.match(line.decode('utf-8'))
+        if match is None:
+            raise HTTPError(-2, 'not http')
         self.method = match.group('method')
         self.version = tuple(
             map(int, (match.group('high'), match.group('low'))))
@@ -48,10 +58,13 @@ class Headers(object):
         """
         self.info = defaultdict(list)
         for line in f:
-            if line == '\r\n' or line == '\n':
+            if line == b'\r\n' or line == b'\n':
                 break
-            stripped = line.strip()
-            header, value = stripped.split(':', 1)
+            stripped = line.strip().decode('utf-8')
+            try:
+                header, value = stripped.split(':', 1)
+            except ValueError:
+                raise HTTPError(-3, 'Bad header: {!r}'.format(line))
             self.info[header.strip().lower()].append(value.strip())
 
     def __str__(self):
@@ -59,10 +72,20 @@ class Headers(object):
         return '\r\n'.join(lines)
 
     def __getitem__(self, header):
-        return self.info[header.lower()]
+        """Get original separated values as a list."""
+        return self.info[header]
+
+    def items(self):
+        for k, v in self.info.items():
+            yield (k, ','.join(v))
 
     def get(self, key, default=None):
-        return self.info.get(key, default)
+        """Get comma joined values."""
+        val = self.info.get(key)
+        if val is None:
+            return default
+        else:
+            return ','.join(val)
 
     def __iter__(self):
         return iter(self.info)
