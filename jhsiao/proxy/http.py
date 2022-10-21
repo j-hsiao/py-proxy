@@ -1,7 +1,17 @@
 """Parsing http1."""
 import re
 from collections import defaultdict
-from urllib.parse import unquote
+import sys
+if sys.version_info.major > 2:
+    from urllib.parse import unquote
+else:
+    from urllib import unquote
+import io
+
+class HTTPError(Exception):
+    def __init__(self, code, msg):
+        super(HTTPError, self).__init__(msg)
+        self.code = code
 
 class Startline(object):
     """Parse http startline."""
@@ -13,29 +23,34 @@ class Startline(object):
     def __init__(self, f):
         """Initialize.
 
-        f: a text file
+        f: a binary file
         """
-        line = f.readline()
-        match = self.pattern.match(line)
+        line = f.readline(io.DEFAULT_BUFFER_SIZE)
+        if not line.endswith(b'\n'):
+            raise HTTPError(414, 'Request-URI Too Long')
+        match = self.pattern.match(line.decode('utf-8'))
         self.method = match.group('method')
-        self.version = tuple(map(int, (match.group('high'), match.group('low'))))
+        self.version = tuple(
+            map(int, (match.group('high'), match.group('low'))))
         self.resource = unquote(match.group('resource'))
 
 class Headers(object):
     """Basic headers parsing.
 
     key: [values...]
+    Values are just the string values of the headers, they are lists to
+    handle repeated headers.
     """
     def __init__(self, f):
         """Initialize.
 
-        f: a text file
+        f: a binary file
         """
         self.info = defaultdict(list)
         for line in f:
-            stripped = line.strip()
-            if not stripped:
+            if line == '\r\n' or line == '\n':
                 break
+            stripped = line.strip()
             header, value = stripped.split(':', 1)
             self.info[header.strip().lower()].append(value.strip())
 
