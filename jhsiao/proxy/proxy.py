@@ -17,6 +17,13 @@ from jhsiao.ipc import sockets, polling, pollable
 from .http import Startline, Headers, HTTPError
 from .multiforward import MultiForwarder
 
+def name(f):
+    name = f.name
+    if isinstance(f.name, tuple):
+        return '{}:{}'.format(*name)
+    else:
+        return name
+
 class StopServing(Exception): pass
 
 class Server(object):
@@ -99,12 +106,14 @@ class Event(pollable.Pollable):
                     except Exception:
                         traceback.print_exc()
                         code = proxy.CLOSE
-                if code == proxy.CLOSE or code == proxy.FORWARD:
+                else:
                     try:
                         poller.unregister(client)
                     except Exception:
                         traceback.print_exc()
-                    if code == proxy.CLOSE:
+                    if code == code == proxy.FORWARD:
+                        client.detach()
+                    elif code == proxy.CLOSE:
                         client.close()
 
 class Client(object):
@@ -137,13 +146,20 @@ class Client(object):
             proxy.q.append(self)
             proxy.cond.notify()
 
+    def detach(self):
+        if self.f is not None:
+            self.r.detach()
+            try:
+                self.w.detach()
+            except Exception:
+                traceback.print_exc()
+            ret = self.f
+            self.f = None
+            return ret
+
     def close(self):
-        self.r.detach()
-        try:
-            self.w.detach()
-        except Exception:
-            traceback.print_exc()
-        self.f.close()
+        if self.f is not None:
+            self.detach().close()
 
 class Proxy(object):
     CLOSE = 0
@@ -171,9 +187,17 @@ class Proxy(object):
         self.done = []
         self.t = None
 
-    @staticmethod
-    def log(*args, **kwargs):
-        print(str(datetime.datetime.now())+':', *args, **kwargs)
+    def log(self, *args, **kwargs):
+        now = datetime.datetime.now()
+        now = now.strftime(
+            '%Y-%m-%d %H:%M:%S.{:02d}: '.format(now.microsecond//10000))
+        if args:
+            args = list(args)
+            args[0] = now+args[0]
+        else:
+            args = (now,)
+        with self.lock:
+            print(*args, **kwargs)
 
     def _hasitems(self):
         """Cond waiting function."""
@@ -181,10 +205,10 @@ class Proxy(object):
 
     def do_CONNECT(self, client, startline, headers):
         host, port = startline.resource.rsplit(':', 1)
-        self.log('CONNECT', client.f.name, '->', startline.resource)
         try:
             remote = sockets.Sockfile(sockets.connect((host, int(port))), 'rwb')
         except Exception:
+            self.log('Failed to connect to {}:{}'.format(host, port))
             msg = traceback.format_exc().encode('utf-8')
             client.w.write((
                 'HTTP/1.1 404 Not Found\r\n'
@@ -220,6 +244,7 @@ class Proxy(object):
         try:
             response = func(startline.resource, timeout=self.timeout, **kwargs)
         except Exception:
+            traceback.print_exc()
             data = traceback.format_exc().encode('utf-8')
             w.write(
                 b'HTTP/1.1 500 Server Error\r\n'
@@ -227,6 +252,7 @@ class Proxy(object):
             w.write('Content-Length: {}\r\n\r\n'.format(len(data)).encode('utf-8'))
             w.write(data)
         else:
+            self.log(name(client.f), startline.resource, response.status_code, response.reason)
             w.write(
                 'HTTP/1.1 {} {}\r\n'.format(
                     response.status_code, response.reason).encode('utf-8'))
@@ -245,7 +271,7 @@ class Proxy(object):
         return self._basic(requests.get, True, *args)
 
     def default(self, client, startline, headers):
-        self.log(startline.method, client.f.name, 'unsupported')
+        self.log(name(client.f), startline.method, 'unsupported')
         client.f.write(b'HTTP/1.1 501 Not Implemented\r\n\r\n')
         return self.REARM
 
@@ -269,9 +295,10 @@ class Proxy(object):
                 startline = Startline(client.f)
                 headers = Headers(client.f)
                 method = startline.method.upper()
+                self.log(name(client.f), method, startline.resource)
                 code = getattr(self, 'do_'+method, self.default)(client, startline, headers)
             except HTTPError as e:
-                self.log(client.f.name, e.code, e.args[0])
+                self.log(name(client.f), e.code, ':', e.args[0])
                 if e.code>0:
                     f.write('HTTP/1.1 {} {}\r\n\r\n'.format(e.code, e.args[0]).encode('utf-8'))
                 code = self.CLOSE if e.code < 0 else self.REARM

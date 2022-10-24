@@ -33,12 +33,12 @@ class Startline(object):
         """
         line = f.readline(io.DEFAULT_BUFFER_SIZE)
         if not line:
-            raise HTTPError(-1, 'closed')
+            raise HTTPError(-1, 'Connection Closed')
         elif not line.endswith(b'\n'):
             raise HTTPError(414, 'Request-URI Too Long')
         match = self.pattern.match(line.decode('utf-8'))
         if match is None:
-            raise HTTPError(-2, 'not http')
+            raise HTTPError(-2, 'Not Http')
         self.method = match.group('method')
         self.version = tuple(
             map(int, (match.group('high'), match.group('low'))))

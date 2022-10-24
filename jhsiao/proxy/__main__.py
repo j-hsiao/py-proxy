@@ -32,6 +32,8 @@ if __name__ == '__main__':
             ' with 503 Service Unavailable'), type=int, default=None)
     p.add_argument(
         '-t', '--threads', help='number of handler threads', type=int, default=1)
+    p.add_argument(
+        '--timeout', help='timeout in seconds', type=float, default=60)
     args = p.parse_args()
     idx = args.bindaddr.find(':')
     if idx < 0:
@@ -48,7 +50,7 @@ if __name__ == '__main__':
         kwargs['blocked'] = list(map(mask2pair, args.block))
     kwargs['maxsize'] = args.max
     kwargs['numthreads'] = args.threads
-
+    kwargs['timeout'] = args.timeout
     p = Proxy(**kwargs)
     p.start()
     # run() does not respond to keyboard interrupt
