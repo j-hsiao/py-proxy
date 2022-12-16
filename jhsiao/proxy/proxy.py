@@ -213,7 +213,7 @@ class Proxy(object):
             client.w.write((
                 'HTTP/1.1 404 Not Found\r\n'
                 'Content-Type: text\r\n'
-                'Content-length: {}\r\n\r\n').format(len(msg)))
+                'Content-length: {}\r\n\r\n').format(len(msg)).encode('utf-8'))
             client.w.write(msg)
             client.w.flush()
             return self.CLOSE
@@ -242,7 +242,7 @@ class Proxy(object):
             kwargs['data'] = client.r.read(int(dlen))
         w = client.w
         try:
-            response = func(startline.resource, timeout=self.timeout, **kwargs)
+            response = func(startline.resource, timeout=self.timeout, stream=True, **kwargs)
         except Exception:
             traceback.print_exc()
             data = traceback.format_exc().encode('utf-8')
@@ -260,15 +260,19 @@ class Proxy(object):
                 w.write(': '.join(header).encode('utf-8'))
                 w.write(b'\r\n')
             w.write(b'\r\n')
-            client.w.write(response.content)
+            with response as resp:
+                for chunk in resp.iter_content(io.DEFAULT_BUFFER_SIZE):
+                    w.write(chunk)
+            w.flush()
+            #client.w.write(response.content)
         return code
 
     def do_GET(self, *args):
         return self._basic(requests.get, False, *args)
     def do_POST(self, *args):
-        return self._basic(requests.get, True, *args)
+        return self._basic(requests.post, True, *args)
     def do_PUT(self, *args):
-        return self._basic(requests.get, True, *args)
+        return self._basic(requests.put, True, *args)
 
     def default(self, client, startline, headers):
         self.log(name(client.f), startline.method, 'unsupported')
