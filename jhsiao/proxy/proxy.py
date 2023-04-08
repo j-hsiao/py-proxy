@@ -111,7 +111,7 @@ class Event(pollable.Pollable):
                         poller.unregister(client)
                     except Exception:
                         traceback.print_exc()
-                    if code == code == proxy.FORWARD:
+                    if code == proxy.FORWARD:
                         client.detach()
                     elif code == proxy.CLOSE:
                         client.close()
