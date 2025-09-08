@@ -9,6 +9,7 @@ import threading
 import threading
 import time
 import traceback
+import itertools
 
 import requests
 
@@ -26,9 +27,39 @@ def name(f):
 
 class StopServing(Exception): pass
 
+
+def int2ipv6(nums, _fmt=':'.join(['{:04x}']*8)):
+    """Expand 8 ints into a full IPV6 address.
+
+    nums: Sequence of 8 numbers
+    """
+    return _fmt.format(*nums)
+
+def ipv62int(ipv6):
+    """Convert generic ipv6 string address to sequence of 8 ints."""
+    parts = [[], (), []]
+    target = 0
+    for x in ipv6.split(':'):
+        if x:
+            parts[target].append(int(x, 16))
+        else:
+            target = 2
+
+    nnum = len(parts[0]) + len(parts[2])
+    if nnum < 8:
+        parts[1] = itertools.repeat(0, (8-nnum))
+    return itertools.chain.from_iterable(parts)
+
+def expand_ipv6(ipv6):
+    """Convert arbitrary ipv6 string address into canonical form."""
+    return int2ipv6(ipv62int(ipv6))
+
 class Server(object):
     bstruct = struct.Struct('4B')
     ustruct = struct.Struct('>L')
+
+    bstructv6 = struct.Struct('>8H')
+    ustructv6 = struct.Struct('>2Q')
     def __init__(self, proxy):
         self.socket = sockets.bind(proxy.addr)
         print('bound to', proxy.addr)
@@ -36,31 +67,83 @@ class Server(object):
         self.fileno = self.socket.fileno
         self.timeout = proxy.timeout
 
-        self.allowed = [
-            (self.ip2bytes(net), 32-mask) for net, mask in proxy.allowed]
-        self.blocked = [
-            (self.ip2bytes(net), 32-mask) for net, mask in proxy.blocked]
+        self.allowed = self.compile_nets(proxy.allowed)
+        self.blocked = self.compile_nets(proxy.blocked)
 
     @classmethod
-    def matchip(cls, ip, targets):
-        checkui = cls.ustruct.unpack(
-            cls.bstruct.pack(*map(int, ip.split('.'))))[0]
-        for uip, shift in targets:
-            if (uip>>shift) == (checkui>>shift):
+    def matchip(cls, ipnums, targets):
+        """Return whether ipnums matches any networks in targets
+
+        ip: sequence  of ints
+        targets: sequence of pairs of sequence of int.
+            [(targetipnums, targetipmasks), ...]
+        """
+        for target, masks in targets:
+            if len(ipnums) == len(target) and all(
+                    [inum & tmask == tnum
+                    for inum, tnum, tmask
+                    in zip(ipnums, target, masks)]):
                 return True
         return False
 
     @classmethod
-    def ip2bytes(cls, ip):
-        return cls.ustruct.unpack(
-            cls.bstruct.pack(*map(int, ip.split('.'))))[0]
+    def ip2nums(cls, ip):
+        """Convert a string ip into sequence of ints."""
+        if ':' in ip:
+            parts = [[], (), []]
+            target = 0
+            for x in ip.split(':'):
+                if x:
+                    parts[target].append(int(x, 16))
+                else:
+                    target = 2
+            nnum = len(parts[0]) + len(parts[2])
+            if nnum < 8:
+                parts[1] = itertools.repeat(0, (8-nnum))
+            return cls.ustructv6.unpack(
+                cls.bstructv6.pack(*itertools.chain.from_iterable(parts)))
+        else:
+            return cls.ustruct.unpack(
+                cls.bstruct.pack(*map(int, ip.split('.'))))
+
+    @classmethod
+    def netbits2mask(cls, nbits, v6):
+        """Convert network prefix bitcount into a sequence of masks.
+
+        Parallel to ip2nums.
+        """
+        if v6:
+            IPV6BITS = 128
+            IPV6MASK = 0xFFFFFFFFFFFFFFFF
+            if nbits > 64:
+                return (IPV6MASK, (IPV6MASK << (IPV6BITS-nbits)) & IPV6MASK)
+            else:
+                return ((IPV6MASK << (64-nbits)) & IPV6MASK, 0)
+        else:
+            IPV4BITS = 32
+            IPV4MASK = 0xFFFFFFFF
+            return ((IPV4MASK << (IPV4BITS-nbits)) & IPV4MASK,)
+
+    @classmethod
+    def compile_nets(cls, nets):
+        ret = []
+        for net, maskbits in nets:
+            isipv6 = ':' in net
+            nums = cls.ip2nums(net)
+            masks = cls.netbits2mask(maskbits, isipv6)
+            ret.append((tuple([n&m for n,m in zip(nums, masks)]), masks))
+        return ret
+
 
     def __call__(self, proxy):
         c, addr = self.socket.accept()
         c.settimeout(self.timeout)
         client = Client(c)
-        if (self.matchip(addr[0], self.blocked)
-                or not self.matchip(addr[0], self.allowed)):
+
+        nums = self.ip2nums(addr[0])
+        if (
+                (self.blocked and self.matchip(nums, self.blocked))
+                or (self.allowed and not self.matchip(nums, self.allowed))):
             proxy.log('blocked ip', addr[0])
             self._trysend(client, b'HTTP/1.1 403 Forbidden\r\n\r\n')
             return
@@ -167,7 +250,7 @@ class Proxy(object):
     FORWARD = 2
     def __init__(
         self, ip='0.0.0.0', port=3128,
-        allowed=[('127.0.0.1', 32), ('10.36.0.0', 16), ('192.168.0.0', 16)],
+        allowed=[('127.0.0.1', 32), ('10.36.0.0', 16), ('192.168.0.0', 16), ('::1', 128)],
         blocked=(), maxsize=None, numthreads=1, timeout=60):
         """Initialize.
 
